@@ -75,10 +75,11 @@ write_csv(
 library(rtracklayer)
 
 # Data was counted using Gencode v24
-download.file(
-  "ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_24/gencode.v24.chr_patch_hapl_scaff.basic.annotation.gtf.gz",
-  file.path(dir_data, "gencode.v24.chr_patch_hapl_scaff.basic.annotation.gtf.gz")
-)
+if (!file.exists(file.path(dir_data, "gencode.v24.chr_patch_hapl_scaff.basic.annotation.gtf.gz")))
+  download.file(
+    "ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_24/gencode.v24.chr_patch_hapl_scaff.basic.annotation.gtf.gz",
+    file.path(dir_data, "gencode.v24.chr_patch_hapl_scaff.basic.annotation.gtf.gz")
+  )
 
 gene_info <- GTFFile(file.path(dir_data, "gencode.v24.chr_patch_hapl_scaff.basic.annotation.gtf.gz")) %>%
   import() %>%
@@ -90,6 +91,12 @@ protein_coding <- gene_info %>%
   unique()
 
 meta_deseq <- meta %>%
+  mutate(
+    age_death = age_death %>%
+      recode(`90+` = "90") %>%
+      as.double(),
+    age_death_scaled = scale(age_death)[, 1]
+  ) %>%
   filter(rnaseq_id %in% colnames(counts)) %>%
   arrange(rnaseq_id) %>%
   column_to_rownames("rnaseq_id")
@@ -105,43 +112,92 @@ unloadNamespace("synapser")
 unloadNamespace("PythonEmbedInR")
 
 deseq_dataset <- DESeqDataSetFromMatrix(
-  counts_deseq, meta_deseq, design = ~ batch + stage
+  counts_deseq, meta_deseq, design = ~ age_death_scaled + batch + stage
 )
 
 deseq_de <- DESeq(deseq_dataset)
 
 write_rds(
   deseq_de,
-  file.path(dir_data, "deseq.rds"),
+  file.path(dir_data, "deseq_age.rds"),
   compress = "gz"
 )
 
+extract_result <- function(de, name) {
+  res <- results(de, name = name, parallel = FALSE)
+  shrunken <- lfcShrink(de, coef = name, res = res, type = "apeglm", parallel = FALSE)
+  shrunken %>%
+    as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    as_tibble() %>%
+    left_join(
+      gene_info %>%
+        distinct(gene_id, gene_name),
+      by = "gene_id"
+    ) %>%
+    left_join(
+      res %>%
+        as.data.frame() %>%
+        rownames_to_column("gene_id") %>%
+        select(gene_id, log2FoldChange_MLE = log2FoldChange, lfcSE_MLE = lfcSE),
+      by = "gene_id"
+    ) %>%
+    select(gene_id, gene_name, everything()) %>%
+    arrange(padj)
+}
+
 resultsNames(deseq_de)
 
-res_c_vs_a <- results(deseq_de, name = "stage_C_vs_A")
-res_c_vs_a_shrunken <- lfcShrink(deseq_de, coef = "stage_C_vs_A", type = "apeglm")
-
-res_c_vs_a_df <- res_c_vs_a_shrunken %>%
-  as.data.frame() %>%
-  rownames_to_column("gene_id") %>%
-  as_tibble() %>%
-  left_join(
-    gene_info %>%
-      distinct(gene_id, gene_name),
-    by = "gene_id"
-  ) %>%
-  left_join(
-    res_c_vs_a %>%
-      as.data.frame() %>%
-      rownames_to_column("gene_id") %>%
-      select(gene_id, log2FoldChange_MLE = log2FoldChange, lfcSE_MLE = lfcSE),
-    by = "gene_id"
-  ) %>%
-  select(gene_id, gene_name, everything()) %>%
-  arrange(padj)
+res_c_vs_a <- extract_result(deseq_de, name = "stage_C_vs_A")
+res_age <- extract_result(deseq_de, name = "age_death_scaled")
 
 write_csv(
-  res_c_vs_a_df,
-  here("amp_ad_stage_C_vs_A.csv")
+  res_c_vs_a,
+  here("amp_ad_stage_C_vs_A_age_adjusted.csv")
 )
 
+bind_rows(
+  "c_vs_a" = res_c_vs_a,
+  "age_death" = res_age,
+  .id = "comparison"
+) %>%
+  ggplot(aes(baseMean, log2FoldChange, color = padj < 0.05)) +
+    geom_point() +
+    scale_x_log10() +
+    facet_wrap(vars(comparison))
+
+volcano_plot <- bind_rows(
+  "c_vs_a" = res_c_vs_a,
+  "age_death" = res_age,
+  .id = "comparison"
+) %>%
+  ggplot(aes(log2FoldChange, -log10(padj))) +
+  geom_point() +
+  facet_wrap(vars(comparison))
+
+ggsave(
+  file.path(dir_plots, "volcano_age_c_vs_a.pdf"),
+  volcano_plot
+)
+
+# Age matching -----------------------------------------------------------------
+###############################################################################T
+
+library(MatchIt)
+
+meta_matching <- meta_deseq %>%
+  rownames_to_column("sample") %>%
+  mutate_at(vars(stage, batch), as.factor) %>%
+  as_tibble() %>%
+  filter(stage %in% c("A", "B")) %>%
+  mutate(stage = if_else(stage == "A", 1L, 0L)) %>%
+  select(stage, batch, age_death)
+
+meta_matched <- matchit(
+  stage ~ age_death,
+  data = meta_matching,
+  method = "nearest"
+)
+
+summary(meta_matched)
+## Ugh, somehow makes difference in ages even worse...
