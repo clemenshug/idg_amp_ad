@@ -45,7 +45,7 @@ meta <- amp_ad_meta_raw %>%
   mutate(
     data = map(
       data,
-      select, rnaseq_id, braak, batch
+      select, rnaseq_id, braak, batch, age_death
     ) %>%
       map(mutate_at, vars(braak), as.character)
   ) %>%
@@ -60,12 +60,12 @@ counts <- amp_ad_counts_raw %>%
 
 write_csv(
   meta,
-  file.path(dir_data, "meta_wangled.csv.gz")
+  file.path(dir_data, "meta_wrangled.csv.gz")
 )
 
 write_csv(
   counts,
-  file.path(dir_data, "counts_wangled.csv.gz")
+  file.path(dir_data, "counts_wrangled.csv.gz")
 )
 
 # Differential expression ------------------------------------------------------
